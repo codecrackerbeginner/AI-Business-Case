@@ -1,0 +1,204 @@
+package.json
+
+{
+  "name": "hq-business-case",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": { "dev": "next dev", "build": "next build", "start": "next start" },
+  "dependencies": { "next": "14.2.5", "react": "18.3.1", "react-dom": "18.3.1" }
+}
+middleware.ts
+
+import { NextRequest, NextResponse } from "next/server";
+import { verify } from "./lib/crypto";
+export function middleware(req: NextRequest) {
+  const { pathname } = req.nextUrl;
+  if (pathname.startsWith("/login") || pathname.startsWith("/api/login") || pathname.startsWith("/_next")) {
+    return NextResponse.next();
+  }
+  if (!verify(req.cookies.get("auth")?.value)) {
+    const url = req.nextUrl.clone(); url.pathname = "/login";
+    return NextResponse.redirect(url);
+  }
+  return NextResponse.next();
+}
+export const config = { matcher: ["/((?!favicon.ico).*)"] };
+lib/crypto.ts
+
+import crypto from "crypto";
+const secret = () => process.env.COOKIE_SECRET || "dev-secret";
+export function sign(v: string) {
+  const h = crypto.createHmac("sha256", secret()).update(v).digest("hex");
+  return `${v}.${h}`;
+}
+export function verify(signed?: string) {
+  if (!signed) return false;
+  const i = signed.lastIndexOf(".");
+  if (i < 0) return false;
+  const v = signed.slice(0, i), h = signed.slice(i + 1);
+  const good = crypto.createHmac("sha256", secret()).update(v).digest("hex");
+  return crypto.timingSafeEqual(Buffer.from(h), Buffer.from(good)) && v === "ok";
+}
+lib/model.ts
+
+export type Inputs = {
+  Dealers: number; RevPerCar: number; HQ_Margin_Pct: number; Calls_Dealer: number;
+  MissedRate: number; LeadShare: number; LeadConv: number; HQ_Setup: number;
+  HQ_OpEx: number; YearStart: number; YearEnd: number; WACC: number;
+};
+export function compute(i: Inputs) {
+  const numYears = i.YearEnd - i.YearStart + 1;
+  const marginVeh = i.RevPerCar * i.HQ_Margin_Pct;
+  const incrNetwork = i.Calls_Dealer * i.MissedRate * i.LeadShare * i.LeadConv * i.Dealers;
+  const grossAnnual = incrNetwork * marginVeh;
+  const netAnnual = grossAnnual - i.HQ_OpEx;
+  const years: number[] = [], gross: number[] = [], net: number[] = [], ncf: number[] = [], cum: number[] = [], disc: number[] = [];
+  let run = 0;
+  for (let t = 1; t <= numYears; t++) {
+    const capex = t === 1 ? -i.HQ_Setup : 0;
+    const cf = grossAnnual - i.HQ_OpEx + capex;
+    run += cf;
+    years.push(i.YearStart + t - 1); gross.push(grossAnnual); net.push(netAnnual);
+    ncf.push(cf); cum.push(run); disc.push(cf / Math.pow(1 + i.WACC, t));
+  }
+  return {
+    numYears, marginVeh, incrNetwork, grossAnnual, netAnnual,
+    years, gross, net, ncf, cum,
+    ncf6: ncf.reduce((a, b) => a + b, 0),
+    paybackYears: i.HQ_Setup / netAnnual,
+    paybackMonths: (i.HQ_Setup / netAnnual) * 12,
+    npv: disc.reduce((a, b) => a + b, 0),
+    totalInvest: -i.HQ_Setup, totalOpEx: -i.HQ_OpEx * numYears,
+  };
+}
+app/layout.tsx
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return <html lang="en"><body style={{ margin: 0, fontFamily: "sans-serif" }}>{children}</body></html>;
+}
+app/page.tsx
+
+"use client";
+import { useEffect, useMemo, useState } from "react";
+import { compute, Inputs } from "../lib/model";
+const FIELDS: { n: keyof Inputs; label: string; pct: boolean; step: number }[] = [
+  { n: "Dealers", label: "Dealers in pilot", pct: false, step: 1 },
+  { n: "RevPerCar", label: "Revenue per new car (EUR)", pct: false, step: 1000 },
+  { n: "HQ_Margin_Pct", label: "HQ transfer margin", pct: true, step: 0.5 },
+  { n: "Calls_Dealer", label: "Inbound calls / dealer / yr", pct: false, step: 500 },
+  { n: "MissedRate", label: "Missed call rate", pct: true, step: 1 },
+  { n: "LeadShare", label: "Missed calls w/ lead potential", pct: true, step: 0.5 },
+  { n: "LeadConv", label: "Lead-to-sale conversion", pct: true, step: 0.5 },
+  { n: "HQ_Setup", label: "HQ one-time setup (EUR)", pct: false, step: 10000 },
+  { n: "HQ_OpEx", label: "HQ annual OpEx (EUR)", pct: false, step: 5000 },
+  { n: "WACC", label: "Discount rate / WACC", pct: true, step: 0.5 },
+];
+const eur = (v: number) => new Intl.NumberFormat("en", { maximumFractionDigits: 0 }).format(v) + " EUR";
+export default function Page() {
+  const [base, setBase] = useState<any>(null);
+  const [inp, setInp] = useState<Inputs | null>(null);
+  useEffect(() => {
+    fetch("/model.json").then(r => r.json()).then(d => { setBase(d); setInp(d.inputs); });
+  }, []);
+  const out = useMemo(() => (inp ? compute(inp) : null), [inp]);
+  if (!inp || !out || !base) return <p style={{ padding: 24 }}>Loading model…</p>;
+  const set = (n: keyof Inputs, ui: number, pct: boolean) =>
+    setInp({ ...inp, [n]: pct ? ui / 100 : ui });
+  return (
+    <main style={{ padding: 24, maxWidth: 1100, margin: "0 auto" }}>
+      <h1 style={{ color: "#0E3A2F" }}>{base.initiative}</h1>
+      <p style={{ color: "#555" }}>{base.market} · published {base.publishedAt}</p>
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", margin: "16px 0" }}>
+        {[["NPV @ WACC", eur(out.npv)], ["6-yr net cash flow", eur(out.ncf6)],
+          ["Payback", `${out.paybackMonths.toFixed(1)} months`], ["Total HQ investment", eur(out.totalInvest)]]
+          .map(([k, v]) => (
+          <div key={k} style={{ flex: "1 1 200px", background: "#D6E2DD", padding: 16, borderRadius: 8 }}>
+            <div style={{ fontSize: 12, color: "#0E3A2F" }}>{k}</div>
+            <div style={{ fontSize: 22, fontWeight: 700 }}>{v}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{ display: "flex", gap: 32, flexWrap: "wrap" }}>
+        <section style={{ flex: "1 1 340px" }}>
+          <h3>Assumptions</h3>
+          {FIELDS.map(f => {
+            const ui = f.pct ? Math.round((inp[f.n] as number) * 1000) / 10 : inp[f.n];
+            return (
+              <div key={f.n} style={{ marginBottom: 10 }}>
+                <label style={{ fontSize: 13 }}>{f.label}: <b>{ui}{f.pct ? "%" : ""}</b></label>
+                <input type="number" step={f.step} value={ui as number}
+                  onChange={e => set(f.n, Number(e.target.value), f.pct)}
+                  style={{ width: "100%", padding: 6 }} />
+              </div>
+            );
+          })}
+          <button onClick={() => setInp(base.inputs)} style={{ marginTop: 8, padding: "8px 14px" }}>
+            Reset to published base
+          </button>
+        </section>
+        <section style={{ flex: "1 1 480px" }}>
+          <h3>Cash flow {out.years[0]}–{out.years[out.years.length - 1]}</h3>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+            <thead><tr>{["", ...out.years].map((y, i) =>
+              <th key={i} style={{ textAlign: "right", borderBottom: "2px solid #0E3A2F", padding: 6 }}>{y}</th>)}</tr></thead>
+            <tbody>
+              {[["Gross benefit", out.gross], ["Net benefit", out.net], ["Net cash flow", out.ncf], ["Cumulative", out.cum]].map(([lab, row]: any) => (
+                <tr key={lab}>
+                  <td style={{ padding: 6 }}>{lab}</td>
+                  {row.map((v: number, i: number) => <td key={i} style={{ textAlign: "right", padding: 6 }}>{eur(v)}</td>)}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+      </div>
+    </main>
+  );
+}
+app/login/page.tsx
+
+"use client";
+import { useState } from "react";
+export default function Login() {
+  const [pw, setPw] = useState(""); const [err, setErr] = useState(false);
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    const r = await fetch("/api/login", { method: "POST", body: JSON.stringify({ password: pw }) });
+    if (r.ok) location.href = "/"; else setErr(true);
+  }
+  return (
+    <form onSubmit={submit} style={{ maxWidth: 320, margin: "20vh auto", fontFamily: "sans-serif" }}>
+      <h2 style={{ color: "#0E3A2F" }}>HQ Business Case</h2>
+      <input type="password" value={pw} onChange={e => setPw(e.target.value)} placeholder="Password"
+        style={{ width: "100%", padding: 10 }} />
+      <button style={{ marginTop: 12, padding: "10px 16px", background: "#0E3A2F", color: "#fff", border: 0 }}>Enter</button>
+      {err && <p style={{ color: "crimson" }}>Wrong password</p>}
+    </form>
+  );
+}
+app/api/login/route.ts
+
+import { NextResponse } from "next/server";
+import { sign } from "../../../lib/crypto";
+export async function POST(req: Request) {
+  const { password } = await req.json();
+  if (password !== process.env.SITE_PASSWORD) {
+    return NextResponse.json({ ok: false }, { status: 401 });
+  }
+  const res = NextResponse.json({ ok: true });
+  res.cookies.set("auth", sign("ok"), { httpOnly: true, secure: true, sameSite: "lax", path: "/", maxAge: 60 * 60 * 8 });
+  return res;
+}
+public/model.json
+
+{
+  "publishedAt": "seed",
+  "initiative": "BIG Ticket 6: AI Inbound & Outbound Calls",
+  "market": "Czech Republic",
+  "inputs": {
+    "Dealers": 20, "RevPerCar": 30000, "HQ_Margin_Pct": 0.05,
+    "Calls_Dealer": 18000, "MissedRate": 0.25, "LeadShare": 0.03,
+    "LeadConv": 0.03, "HQ_Setup": 120000, "HQ_OpEx": 40000,
+    "YearStart": 2027, "YearEnd": 2032, "WACC": 0.08
+  }
+}
