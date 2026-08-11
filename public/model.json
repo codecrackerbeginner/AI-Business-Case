@@ -1,0 +1,11 @@
+{
+  "publishedAt": "seed",
+  "initiative": "BIG Ticket 6: AI Inbound & Outbound Calls",
+  "market": "Czech Republic",
+  "inputs": {
+    "Dealers": 20, "RevPerCar": 30000, "HQ_Margin_Pct": 0.05,
+    "Calls_Dealer": 18000, "MissedRate": 0.25, "LeadShare": 0.03,
+    "LeadConv": 0.03, "HQ_Setup": 120000, "HQ_OpEx": 40000,
+    "YearStart": 2027, "YearEnd": 2032, "WACC": 0.08
+  }
+}
